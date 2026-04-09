@@ -1,0 +1,66 @@
+# ==========================================
+# 1. 加载所有数据 (新增了 5 个模型)
+# ==========================================
+df_true         = load_and_sort_data('date/TR-TQNet.csv') 
+df_lstm         = load_and_sort_data('date/LSTM.csv')
+df_itransformer = load_and_sort_data('date/iTransformer.csv')
+df_autoformer   = load_and_sort_data('date/Autoformer.csv')
+
+# 新增的模型
+df_cross        = load_and_sort_data('date/Crossformer.csv')
+df_dlinear      = load_and_sort_data('date/DLinear.csv')
+df_fed          = load_and_sort_data('date/FEDformer.csv')
+df_patchtst     = load_and_sort_data('date/PatchTST.csv')
+# 注意：之前的文件名叫 'Vanilla TQNet.csv'，这里按照你的要求使用 'TQNet_Vanilla.csv'
+df_vanilla      = load_and_sort_data('date/TQNet_Vanilla.csv') 
+
+# 生成 X 轴标签格式：00:00, 01:00 ...
+hours_labels = df_true['Hour'].astype(str).str.zfill(2) + ':00'
+
+# ==========================================
+# 2. 绘制 24 小时轨迹与包络图
+# ==========================================
+# 适当增加图片高度，为上方庞大的图例留出空间
+plt.figure(figsize=(14, 7))
+
+# 绘制 ±3% 调度基准区间 (SBI) 灰色阴影 
+# 【注意】：既然你乘了 0.97 和 1.03，这里标签我帮你改成了 3%。如果是 10%，请改回 0.9 和 1.1
+plt.fill_between(hours_labels, df_true['True'] * 0.97, df_true['True'] * 1.03, 
+                 color='gray', alpha=0.25, label=r'$\pm 3\%$ SBI Envelope', linewidth=0)
+
+# ==========================================
+# 3. 绘制所有曲线 (注意控制 alpha 透明度和 zorder 图层)
+# ==========================================
+
+# 1. 真实负荷 (黑实线，加粗)
+plt.plot(hours_labels, df_true['True'], color='black', linewidth=3.5, label='True Load', zorder=5)
+
+# 2. 对比模型群 (降低透明度 alpha=0.8，使用较细的线宽 linewidth=1.5~2，避免喧宾夺主)
+plt.plot(hours_labels, df_itransformer['Pred'], color='#2a9d8f', linewidth=2, 
+         linestyle='--', marker='s', markersize=4, alpha=0.8, label='iTransformer', zorder=3)
+
+plt.plot(hours_labels, df_autoformer['Pred'], color='#9c89b8', linewidth=2, 
+         linestyle='-.', marker='^', markersize=4, alpha=0.8, label='Autoformer', zorder=3)
+
+plt.plot(hours_labels, df_lstm['Pred'], color='#457b9d', linewidth=2, 
+         linestyle=':', marker='x', markersize=5, alpha=0.8, label='LSTM', zorder=2)
+
+# 新增 5 个对比模型
+plt.plot(hours_labels, df_cross['Pred'], color='#f4a261', linewidth=2, 
+         linestyle='--', marker='D', markersize=4, alpha=0.8, label='Crossformer', zorder=4)
+
+plt.plot(hours_labels, df_dlinear['Pred'], color='#e9c46a', linewidth=2, 
+         linestyle='-.', marker='v', markersize=5, alpha=0.8, label='DLinear', zorder=3)
+
+plt.plot(hours_labels, df_fed['Pred'], color='#e07a5f', linewidth=2, 
+         linestyle=':', marker='p', markersize=5, alpha=0.8, label='FEDformer', zorder=2)
+
+plt.plot(hours_labels, df_patchtst['Pred'], color='#0077b6', linewidth=2, 
+         linestyle='--', marker='*', markersize=6, alpha=0.8, label='PatchTST', zorder=4)
+
+plt.plot(hours_labels, df_vanilla['Pred'], color='#8d99ae', linewidth=2, 
+         linestyle='-.', marker='h', markersize=5, alpha=0.8, label='Vanilla TQNet', zorder=3)
+
+# 3. 本文提出的模型 TR-TQNet (放在最后画，确保图层在最上面，红色高亮)
+plt.plot(hours_labels, df_true['Pred'], color='#e63946', linewidth=3, 
+         linestyle='-', marker='o', markersize=7, label='TR-TQNet (Ours)', zorder=10)
