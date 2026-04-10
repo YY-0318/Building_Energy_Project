@@ -28,7 +28,7 @@ class SeriesDecomp(nn.Module):
         return res, moving_mean
 
 class LongTermDualTQNet(nn.Module):
-    def __init__(self, input_dim, seq_len, pred_len, d_model=128, patch_len=24, stride=24, top_k=5):
+    def __init__(self, input_dim, seq_len, pred_len, d_model=128, patch_len=48, stride=24, top_k=15):
         super().__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
@@ -38,7 +38,7 @@ class LongTermDualTQNet(nn.Module):
         self.num_days_out = pred_len // patch_len 
         
         self.decomp = SeriesDecomp(kernel_size=25)
-        
+        self.feature_fusion = nn.Linear(input_dim, 1)
         # =========================================================
         # 1. 宏观趋势分支 (DTE: 阻尼趋势外推)
         # =========================================================
@@ -73,8 +73,11 @@ class LongTermDualTQNet(nn.Module):
         
         # 【核心修复】：将原本的复数全连接层，拆解为两个纯实数全连接层！
         # 彻底绕过 PyTorch 的 _foreach_add 复数碰撞 Bug
-        self.freq_proj_real = nn.Linear(freq_in, freq_in)
-        self.freq_proj_imag = nn.Linear(freq_in, freq_in)
+        # self.freq_proj_real = nn.Linear(freq_in, freq_in)
+        # self.freq_proj_imag = nn.Linear(freq_in, freq_in)
+        
+        # 在 __init__ 中修改频域线性层
+        self.freq_proj = nn.Linear(freq_in * 2, freq_in * 2) # 合并处理
         
         self.head_seasonal = nn.Sequential(
             nn.Flatten(),
@@ -130,13 +133,31 @@ class LongTermDualTQNet(nn.Module):
         xf_filtered = xf * mask
         
         # 【核心修复执行】：对实部和虚部分别使用普通的实数 Linear 处理
-        xf_real = xf_filtered.real.permute(0, 2, 1)
+#         xf_real = xf_filtered.real.permute(0, 2, 1)
+#         xf_imag = xf_filtered.imag.permute(0, 2, 1)
+        
+#         xf_pred_real = self.freq_proj_real(xf_real).permute(0, 2, 1)
+#         xf_pred_imag = self.freq_proj_imag(xf_imag).permute(0, 2, 1)
+        
+#         # 重新组合为复数信号送入 IFFT
+#         xf_pred = torch.complex(xf_pred_real, xf_pred_imag)
+
+
+        xf_real = xf_filtered.real.permute(0, 2, 1) # [Batch, d_model, freq_in]
         xf_imag = xf_filtered.imag.permute(0, 2, 1)
         
-        xf_pred_real = self.freq_proj_real(xf_real).permute(0, 2, 1)
-        xf_pred_imag = self.freq_proj_imag(xf_imag).permute(0, 2, 1)
+        # 核心修改：将实部和虚部在最后一个维度拼接起来，让它们产生信息交互
+        xf_cat = torch.cat([xf_real, xf_imag], dim=-1) # 维度变成 [Batch, d_model, freq_in * 2]
         
-        # 重新组合为复数信号送入 IFFT
+        # 使用统一的 Linear 层进行处理
+        xf_pred_cat = self.freq_proj(xf_cat)
+        
+        # 处理完后，再从中间一分为二，拆回实部和虚部
+        freq_in = xf_real.shape[-1]
+        xf_pred_real = xf_pred_cat[..., :freq_in].permute(0, 2, 1) 
+        xf_pred_imag = xf_pred_cat[..., freq_in:].permute(0, 2, 1)
+        
+        # 重新组合为复数
         xf_pred = torch.complex(xf_pred_real, xf_pred_imag)
         
         freq_res_emb = torch.fft.irfft(xf_pred, n=self.patch_num, dim=1)
