@@ -8,34 +8,60 @@ from sklearn.manifold import TSNE
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from src.trainer_short import EarlyStopping
 
-# =======================================================
-# 【核心创新 1】：时频联合损失函数 (Time-Freq Joint Loss)
-# 彻底解决“波形形状对齐，但存在轻微时序平移”时的双倍惩罚问题
-# =======================================================
 class TimeFreqLoss(nn.Module):
-    def __init__(self, alpha=0.95):
+    def __init__(self, alpha=0.85, gamma=0.1, tail_weight=2.0):
+        """
+        :param alpha: 时域与频域的权重分配
+        :param gamma: 一阶差分(导数)形状约束的权重
+        :param tail_weight: 尾部惩罚系数 (例如 2.0 表示预测最后一天的 Loss 惩罚是第一天的 2 倍)
+        """
         super(TimeFreqLoss, self).__init__()
         self.alpha = alpha
-        # 抛弃僵硬的 L1，换成带二次平滑的 SmoothL1Loss
-        self.loss_fn = nn.SmoothL1Loss(beta=0.1)
+        self.gamma = gamma
+        self.tail_weight = tail_weight
+        
+        # reduction='none' 允许我们手动对不同时间步施加不同的权重
+        self.loss_fn_none = nn.SmoothL1Loss(beta=0.1, reduction='none') 
+        # reduction='mean' 用于不需要加权的频域和差分计算
+        self.loss_fn_mean = nn.SmoothL1Loss(beta=0.1, reduction='mean') 
         
     def forward(self, pred, true):
-        # 1. 时域绝对误差 (Time Domain L1)
-        loss_time = self.loss_fn(pred, true)
+        # pred 和 true 的形状通常为 [Batch, Pred_Len]
+        batch_size, pred_len = pred.shape
         
-        # 2. 频域形状误差 (Frequency Domain L1)
-        # 使用 rfft 提取实数序列的频域特征
+        # =======================================================
+        # 1. 构造时间加权掩码 (Time-Weighted Mask)
+        # =======================================================
+        # 生成一个从 1.0 线性递增到 self.tail_weight 的权重向量
+        # 例如 pred_len=672, tail_weight=2.0 时：
+        # 第 1 小时的权重是 1.0，第 672 小时的权重是 2.0
+        weights = torch.linspace(1.0, self.tail_weight, steps=pred_len, device=pred.device)
+        weights = weights.unsqueeze(0) # 形状变为 [1, pred_len] 以便广播
+        
+        # =======================================================
+        # 2. 时域误差 (带尾部放大惩罚)
+        # =======================================================
+        # 计算每个时间步的原始 Loss (不求均值)
+        loss_time_raw = self.loss_fn_none(pred, true) 
+        # 乘以时间权重后再求均值
+        loss_time = torch.mean(loss_time_raw * weights) 
+        
+        # =======================================================
+        # 3. 频域误差 (约束整体波形振幅)
+        # =======================================================
         pred_fft = torch.fft.rfft(pred, dim=1, norm="forward")
         true_fft = torch.fft.rfft(true, dim=1, norm="forward")
+        loss_freq = self.loss_fn_mean(torch.abs(pred_fft), torch.abs(true_fft))
         
-        # 只取幅值 (Amplitude)，忽略相位 (Phase)
-        # 这意味着：即使波形有 1-2 小时的平移偏移，只要振幅和周期对了，频域误差就是 0！
-        pred_amp = torch.abs(pred_fft)
-        true_amp = torch.abs(true_fft)
-        loss_freq = self.loss_fn(pred_amp, true_amp)
+        # =======================================================
+        # 4. 一阶差分损失 (约束曲线的斜率和爬坡/下坡时机)
+        # =======================================================
+        diff_pred = torch.diff(pred, dim=1)
+        diff_true = torch.diff(true, dim=1)
+        loss_diff = self.loss_fn_mean(diff_pred, diff_true)
         
-        # 联合输出
-        return self.alpha * loss_time + (1 - self.alpha) * loss_freq
+        # 综合输出
+        return self.alpha * loss_time + (1 - self.alpha) * loss_freq + self.gamma * loss_diff
 
 class TrainerLong:
     def __init__(self, model, train_loader, val_loader, test_loader, scaler, test_dates, args):
@@ -50,31 +76,36 @@ class TrainerLong:
         
         self.criterion = TimeFreqLoss(alpha=0.95) # 强烈约束时序相位
         
-        # =======================================================
-        # 【核心修复】: 参数隔离 (Parameter Isolation)
-        # 绕过 PyTorch 的 _foreach_add 复数 Bug，同时符合数学严谨性
-        # =======================================================
-        real_params = []
-        complex_params = []
-        for p in self.model.parameters():
-            if p.is_complex():
-                complex_params.append(p)
+        decay_params = []
+        no_decay_params = []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param.is_complex():
+                continue # 依然排除复数参数
+            # 排除所有的 bias（偏置）和 norm/revin（归一化层）参数不进行 L2衰减
+            if 'bias' in name or 'norm' in name or 'revin' in name:
+                no_decay_params.append(param)
             else:
-                real_params.append(p)
+                decay_params.append(param)
                 
-        # 仅对实数参数 (Linear层) 施加 L2 正则化防过拟合
-        # 频域复数参数免除正则化，保持纯净的傅里叶变换
-        # 简单暴力的 L2 正则化，强行压制过拟合！
+        optimizer_grouped_parameters = [
+            {'params': decay_params, 'weight_decay': 1e-4},
+            {'params': no_decay_params, 'weight_decay': 0.0}
+        ]
+        
         self.optimizer = torch.optim.Adam(
-            self.model.parameters(), 
-            lr=args.lr, 
-            weight_decay=1e-4 
+            optimizer_grouped_parameters, 
+            lr=args.lr
         )
         
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        # 使用带预热 (Warmup) 的 OneCycleLR 替换 CosineAnnealingLR
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer, 
-            T_max=args.epochs,
-            eta_min=1e-6
+            max_lr=args.lr,
+            steps_per_epoch=len(self.train_loader),
+            epochs=args.epochs,
+            pct_start=0.3 # 前30%的步数用于慢慢提高学习率预热模型
         )
     def calc_metrics(self, preds, trues):
         preds_flat = preds.flatten()
@@ -82,7 +113,10 @@ class TrainerLong:
         mae = mean_absolute_error(trues_flat, preds_flat)
         mse = mean_squared_error(trues_flat, preds_flat)
         r2 = r2_score(trues_flat, preds_flat)
-        mape = np.mean(np.abs((trues_flat - preds_flat) / (trues_flat + 1e-5))) * 100
+        
+        epsilon = np.mean(trues_flat) * 0.01
+        
+        mape = np.mean(np.abs((trues_flat - preds_flat) / (trues_flat + epsilon))) * 100
         return mae, mse, mape, r2
 
     def train(self):
@@ -110,6 +144,9 @@ class TrainerLong:
                 # [新增] 梯度裁剪：防止验证集 Loss 震荡和突然飙升
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
+                
+                self.scheduler.step() # 每训练完一个batch就更新一次学习率
+                
                 batch_losses.append(loss.item())
             
             self.model.eval()
@@ -131,7 +168,7 @@ class TrainerLong:
             print(f"Epoch {epoch+1:03d} | Train Loss: {avg_train:.6f} | Val Loss: {avg_val:.6f} | LR: {current_lr:.6f}")
             
             # 步进学习率 (每个 epoch 结束时调用)
-            self.scheduler.step()
+            #self.scheduler.step()
             
             early_stopping(avg_val, self.model)
             if early_stopping.early_stop: 
